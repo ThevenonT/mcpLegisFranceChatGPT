@@ -1,36 +1,92 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Literal
 
 import requests
 from fastapi import FastAPI, HTTPException
 from mcp.server.fastmcp import FastMCP
 
-app = FastAPI(title="Legifrance MCP", version="0.2.0")
+app = FastAPI(title="Legifrance MCP (PISTE)", version="1.0.0")
 mcp = FastMCP("legifrance", json_response=True)
 
-DASSIGNIES_API_KEY = os.getenv("DASSIGNIES_API_KEY")
-DASSIGNIES_API_URL = os.getenv("DASSIGNIES_API_URL", "").rstrip("/") + "/"
+PISTE_CLIENT_ID = os.getenv("PISTE_CLIENT_ID")
+PISTE_CLIENT_SECRET = os.getenv("PISTE_CLIENT_SECRET")
+PISTE_TOKEN_URL = os.getenv(
+    "PISTE_TOKEN_URL",
+    "https://sandbox-oauth.piste.gouv.fr/api/oauth/token",
+)
+LEGIFRANCE_BASE_URL = os.getenv("LEGIFRANCE_BASE_URL", "").rstrip("/")
+LEGIFRANCE_LODA_PATH = os.getenv("LEGIFRANCE_LODA_PATH", "/consult/loda/search")
+LEGIFRANCE_CODE_PATH = os.getenv("LEGIFRANCE_CODE_PATH", "/consult/code/search")
+LEGIFRANCE_JURI_PATH = os.getenv("LEGIFRANCE_JURI_PATH", "/consult/juri/search")
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "30"))
 
-if not DASSIGNIES_API_KEY or not DASSIGNIES_API_URL.strip("/"):
+if not PISTE_CLIENT_ID or not PISTE_CLIENT_SECRET or not LEGIFRANCE_BASE_URL:
     raise RuntimeError(
-        "Missing required environment variables: DASSIGNIES_API_KEY and DASSIGNIES_API_URL"
+        "Missing required environment variables: PISTE_CLIENT_ID, PISTE_CLIENT_SECRET, LEGIFRANCE_BASE_URL"
     )
 
+_token_cache: dict[str, Any] = {"access_token": None, "expires_at": 0.0}
 
-def _post(endpoint: str, payload: dict[str, Any]) -> Any:
+
+def _get_access_token() -> str:
+    now = time.time()
+    cached = _token_cache.get("access_token")
+    expires_at = float(_token_cache.get("expires_at") or 0)
+    if cached and now < expires_at - 30:
+        return str(cached)
+
     try:
         response = requests.post(
-            f"{DASSIGNIES_API_URL}{endpoint}",
-            params={"api_key": DASSIGNIES_API_KEY},
-            headers={"accept": "*/*", "Content-Type": "application/json"},
+            PISTE_TOKEN_URL,
+            data={"grant_type": "client_credentials"},
+            auth=(PISTE_CLIENT_ID, PISTE_CLIENT_SECRET),
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"OAuth PISTE error: {exc}") from exc
+
+    access_token = payload.get("access_token")
+    expires_in = int(payload.get("expires_in", 3600))
+    if not access_token:
+        raise HTTPException(status_code=502, detail="OAuth PISTE response did not include access_token")
+
+    _token_cache["access_token"] = access_token
+    _token_cache["expires_at"] = now + expires_in
+    return str(access_token)
+
+
+def _post(path: str, payload: dict[str, Any]) -> Any:
+    token = _get_access_token()
+    url = f"{LEGIFRANCE_BASE_URL}{path}"
+
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
             json={k: v for k, v in payload.items() if v is not None},
-            timeout=30,
+            timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
     except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Upstream Legifrance API error: {exc}") from exc
+        body = None
+        if getattr(exc, "response", None) is not None:
+            try:
+                body = exc.response.text
+            except Exception:
+                body = None
+        detail = f"Legifrance API error: {exc}"
+        if body:
+            detail = f"{detail} | body={body}"
+        raise HTTPException(status_code=502, detail=detail) from exc
 
     content_type = response.headers.get("content-type", "")
     if "application/json" in content_type:
@@ -40,7 +96,7 @@ def _post(endpoint: str, payload: dict[str, Any]) -> Any:
 
 @mcp.tool(
     name="rechercher_dans_texte_legal",
-    description="Utilise cet outil pour rechercher un article ou des mots-clés dans un texte légal français précis.",
+    description="Recherche un article ou des mots-clés dans un texte légal français via l'API officielle Legifrance sur PISTE.",
 )
 def rechercher_dans_texte_legal(
     search: str,
@@ -52,7 +108,7 @@ def rechercher_dans_texte_legal(
     page_size: int | None = 10,
 ) -> Any:
     return _post(
-        "loda",
+        LEGIFRANCE_LODA_PATH,
         {
             "search": search,
             "text_id": text_id,
@@ -65,7 +121,7 @@ def rechercher_dans_texte_legal(
 
 @mcp.tool(
     name="rechercher_code",
-    description="Utilise cet outil pour rechercher des articles ou notions dans un code français, par exemple le Code civil.",
+    description="Recherche des notions, articles ou termes dans un code français via l'API officielle Legifrance sur PISTE.",
 )
 def rechercher_code(
     search: str,
@@ -77,7 +133,7 @@ def rechercher_code(
     fetch_all: bool | None = False,
 ) -> Any:
     return _post(
-        "code",
+        LEGIFRANCE_CODE_PATH,
         {
             "search": search,
             "code_name": code_name,
@@ -92,7 +148,7 @@ def rechercher_code(
 
 @mcp.tool(
     name="rechercher_jurisprudence_judiciaire",
-    description="Utilise cet outil pour rechercher la jurisprudence judiciaire française pertinente dans la base JURI de Legifrance.",
+    description="Recherche la jurisprudence judiciaire française dans la base JURI de Legifrance via PISTE.",
 )
 def rechercher_jurisprudence_judiciaire(
     search: str,
@@ -106,7 +162,7 @@ def rechercher_jurisprudence_judiciaire(
     juridiction_judiciaire: list[str] | None = None,
 ) -> Any:
     return _post(
-        "juri",
+        LEGIFRANCE_JURI_PATH,
         {
             "search": search,
             "publication_bulletin": publication_bulletin,
@@ -126,5 +182,14 @@ app.mount("/mcp", mcp_app)
 
 
 @app.get("/")
-def healthcheck() -> dict[str, str]:
-    return {"status": "ok", "mcp": "/mcp"}
+def healthcheck() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "mcp": "/mcp",
+        "auth": "oauth2-client-credentials-piste",
+        "configured_paths": {
+            "loda": LEGIFRANCE_LODA_PATH,
+            "code": LEGIFRANCE_CODE_PATH,
+            "juri": LEGIFRANCE_JURI_PATH,
+        },
+    }
