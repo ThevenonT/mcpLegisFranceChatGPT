@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import os
-import sys
 import time
 from typing import Any, Literal
 
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from mangum import Mangum
 from mcp.server.fastmcp import FastMCP
 
 app = FastAPI(title="Legifrance MCP (PISTE)", version="1.0.0")
@@ -30,7 +30,7 @@ _token_cache: dict[str, Any] = {"access_token": None, "expires_at": 0.0}
 
 def _get_access_token() -> str:
     if not PISTE_CLIENT_ID or not PISTE_CLIENT_SECRET:
-        raise HTTPException(status_code=500, detail="Missing PISTE credentials")
+        raise HTTPException(status_code=500, detail="Missing PISTE_CLIENT_ID or PISTE_CLIENT_SECRET")
     now = time.time()
     cached = _token_cache.get("access_token")
     expires_at = float(_token_cache.get("expires_at") or 0)
@@ -75,10 +75,7 @@ def _post(path: str, payload: dict[str, Any]) -> Any:
         response.raise_for_status()
     except requests.RequestException as exc:
         body = getattr(getattr(exc, "response", None), "text", None)
-        detail = f"Legifrance API error: {exc}"
-        if body:
-            detail = f"{detail} | body={body}"
-        raise HTTPException(status_code=502, detail=detail) from exc
+        raise HTTPException(status_code=502, detail=f"Legifrance error: {exc}" + (f" | {body}" if body else "")) from exc
     if "application/json" in response.headers.get("content-type", ""):
         return response.json()
     return response.text
@@ -96,7 +93,7 @@ def rechercher_code(search: str, code_name: str, champ: str | None = None, sort:
 
 @mcp.tool(name="rechercher_jurisprudence_judiciaire", description="Recherche la jurisprudence judiciaire française dans la base JURI de Legifrance via PISTE.")
 def rechercher_jurisprudence_judiciaire(search: str, publication_bulletin: list[Literal["T", "F"]] | None = None, sort: Literal["PERTINENCE", "DATE_DESC", "DATE_ASC"] | None = "PERTINENCE", champ: str | None = "ALL", type_recherche: str | None = "TOUS_LES_MOTS_DANS_UN_CHAMP", page_size: int | None = 10, fetch_all: bool | None = False, juri_keys: list[str] | None = None, juridiction_judiciaire: list[str] | None = None) -> Any:
-    return _post(LEGIFRANCE_JURI_PATH, {"search": search, "publication_bulletin": publication_bulletin, "sort": sort, "champ": champ, "type_recherche": type_recherche, "page_size": page_size, "fetch_all": fetch_all, "juri_keys": juri_keys, "juridiction_judiciaire": juridiction_judiciaire})
+    return _post(LEGIFRANCE_JURI_PATH, {"search": search, "publication_bulletin": publication_bulletin, "sort": sort, "champ": champ, "type_recherche": type_recherche, "page_size": page_size, "fetch_all": fetch_all, "juri_keys": juri_keys, "juridiction_judiciaire": juridiction_udiciaire})
 
 
 mcp_app = mcp.streamable_http_app()
@@ -112,9 +109,5 @@ def healthcheck() -> dict[str, Any]:
     }
 
 
-# Handler pour Vercel (WSGI/ASGI via mangum)
-try:
-    from mangum import Mangum
-    handler = Mangum(app, lifespan="off")
-except ImportError:
-    handler = app
+# Vercel Python serverless handler
+handler = Mangum(app, lifespan="off")

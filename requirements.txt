@@ -1,4 +1,5 @@
-fastapi[standard]
+fastapi
 requests
 mcp[cli]
 mangum
+uvicorn
