@@ -2,3 +2,4 @@ fastapi
 requests
 mcp[cli]
 uvicorn
+mangum

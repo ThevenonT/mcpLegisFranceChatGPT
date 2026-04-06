@@ -7,6 +7,7 @@ from typing import Any, Literal
 import requests
 from fastapi import FastAPI, HTTPException
 from mcp.server.fastmcp import FastMCP
+from mangum import Mangum
 
 app = FastAPI(title="Legifrance MCP (PISTE)", version="1.0.0")
 mcp = FastMCP("legifrance", json_response=True)
@@ -193,3 +194,7 @@ def healthcheck() -> dict[str, Any]:
             "juri": LEGIFRANCE_JURI_PATH,
         },
     }
+
+
+# Vercel Python runtime handler
+handler = Mangum(app, lifespan="off")
