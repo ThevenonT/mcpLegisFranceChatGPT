@@ -4,10 +4,14 @@ import os
 import time
 from typing import Any, Literal
 
+import anyio
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse, JSONResponse
 from mangum import Mangum
-from mcp.server.fastmcp import FastMCP
+from mcp.server import Server
+from mcp.server.sse import SseServerTransport
+from mcp import types
 
 PISTE_CLIENT_ID = os.environ.get("PISTE_CLIENT_ID", "")
 PISTE_CLIENT_SECRET = os.environ.get("PISTE_CLIENT_SECRET", "")
@@ -23,68 +27,124 @@ _piste_cache: dict[str, Any] = {"access_token": None, "expires_at": 0.0}
 
 def _get_piste_token() -> str:
     if not PISTE_CLIENT_ID or not PISTE_CLIENT_SECRET:
-        raise HTTPException(status_code=500, detail="Missing PISTE credentials")
+        raise ValueError("Missing PISTE credentials")
     now = time.time()
     if _piste_cache["access_token"] and now < float(_piste_cache["expires_at"]) - 30:
         return str(_piste_cache["access_token"])
-    try:
-        r = requests.post(
-            PISTE_TOKEN_URL,
-            data={"grant_type": "client_credentials"},
-            auth=(PISTE_CLIENT_ID, PISTE_CLIENT_SECRET),
-            timeout=REQUEST_TIMEOUT,
-        )
-        r.raise_for_status()
-        p = r.json()
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"PISTE error: {exc}") from exc
-    token = p.get("access_token")
-    if not token:
-        raise HTTPException(status_code=502, detail="No access_token from PISTE")
+    r = requests.post(
+        PISTE_TOKEN_URL,
+        data={"grant_type": "client_credentials"},
+        auth=(PISTE_CLIENT_ID, PISTE_CLIENT_SECRET),
+        timeout=REQUEST_TIMEOUT,
+    )
+    r.raise_for_status()
+    p = r.json()
+    token = p["access_token"]
     _piste_cache["access_token"] = token
     _piste_cache["expires_at"] = now + int(p.get("expires_in", 3600))
     return str(token)
 
 
 def _post(path: str, payload: dict[str, Any]) -> Any:
-    if not LEGIFRANCE_BASE_URL:
-        raise HTTPException(status_code=500, detail="Missing LEGIFRANCE_BASE_URL")
     token = _get_piste_token()
+    r = requests.post(
+        f"{LEGIFRANCE_BASE_URL}{path}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json={k: v for k, v in payload.items() if v is not None},
+        timeout=REQUEST_TIMEOUT,
+    )
+    r.raise_for_status()
+    return r.json() if "application/json" in r.headers.get("content-type", "") else r.text
+
+
+# --- MCP Server (low-level API, compatible stateless) ---
+server = Server("legifrance")
+
+
+@server.list_tools()
+async def list_tools() -> list[types.Tool]:
+    return [
+        types.Tool(
+            name="rechercher_code",
+            description="Recherche des articles ou notions dans un code juridique francais via Legifrance/PISTE.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "search": {"type": "string", "description": "Termes a rechercher (ex: 'L1221-19' ou 'periode essai')"},
+                    "code_name": {"type": "string", "description": "Nom du code (ex: 'Code du travail', 'Code civil')"},
+                    "page_size": {"type": "integer", "default": 10},
+                    "champ": {"type": "string", "enum": ["ALL", "TITLE", "TABLE", "NUM_ARTICLE", "ARTICLE"], "default": "ALL"},
+                },
+                "required": ["search", "code_name"],
+            },
+        ),
+        types.Tool(
+            name="rechercher_dans_texte_legal",
+            description="Recherche dans les textes legislatifs et reglementaires (lois, decrets) via Legifrance/PISTE.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "search": {"type": "string"},
+                    "text_id": {"type": "string", "description": "Identifiant LEGI du texte (optionnel)"},
+                    "page_size": {"type": "integer", "default": 10},
+                },
+                "required": ["search"],
+            },
+        ),
+        types.Tool(
+            name="rechercher_jurisprudence_judiciaire",
+            description="Recherche dans la jurisprudence judiciaire francaise (base JURI) via Legifrance/PISTE.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "search": {"type": "string"},
+                    "page_size": {"type": "integer", "default": 10},
+                    "sort": {"type": "string", "enum": ["PERTINENCE", "DATE_DESC", "DATE_ASC"], "default": "PERTINENCE"},
+                },
+                "required": ["search"],
+            },
+        ),
+    ]
+
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
+    if not LEGIFRANCE_BASE_URL:
+        return [types.TextContent(type="text", text="Erreur: LEGIFRANCE_BASE_URL non configure")]
     try:
-        r = requests.post(
-            f"{LEGIFRANCE_BASE_URL}{path}",
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
-            json={k: v for k, v in payload.items() if v is not None},
-            timeout=REQUEST_TIMEOUT,
-        )
-        r.raise_for_status()
-    except requests.RequestException as exc:
-        body = getattr(getattr(exc, "response", None), "text", None)
-        raise HTTPException(status_code=502, detail=f"Legifrance error: {exc}" + (f" | {body}" if body else "")) from exc
-    if "application/json" in r.headers.get("content-type", ""):
-        return r.json()
-    return r.text
+        if name == "rechercher_code":
+            result = _post(LEGIFRANCE_CODE_PATH, arguments)
+        elif name == "rechercher_dans_texte_legal":
+            result = _post(LEGIFRANCE_LODA_PATH, arguments)
+        elif name == "rechercher_jurisprudence_judiciaire":
+            result = _post(LEGIFRANCE_JURI_PATH, arguments)
+        else:
+            return [types.TextContent(type="text", text=f"Outil inconnu: {name}")]
+        import json
+        return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+    except Exception as exc:
+        return [types.TextContent(type="text", text=f"Erreur: {exc}")]
 
 
-# MCP server — exposed directement a la racine de cette fonction
-mcp = FastMCP("legifrance", json_response=True)
+# --- FastAPI + SSE transport ---
+app = FastAPI(title="Legifrance MCP", redirect_slashes=False)
+sse = SseServerTransport("/mcp/messages")
 
 
-@mcp.tool(name="rechercher_dans_texte_legal", description="Recherche un article ou des mots-cles dans un texte legal francais via Legifrance/PISTE.")
-def rechercher_dans_texte_legal(search: str, text_id: str | None = None, champ: Literal["ALL", "TITLE", "TABLE", "NUM_ARTICLE", "ARTICLE"] | None = None, type_recherche: Literal["TOUS_LES_MOTS_DANS_UN_CHAMP", "EXPRESSION_EXACTE", "AU_MOINS_UN_MOT"] | None = None, page_size: int | None = 10) -> Any:
-    return _post(LEGIFRANCE_LODA_PATH, {"search": search, "text_id": text_id, "champ": champ, "type_recherche": type_recherche, "page_size": page_size})
+@app.get("/mcp")
+async def mcp_sse(request: Request):
+    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+        await server.run(streams[0], streams[1], server.create_initialization_options())
 
 
-@mcp.tool(name="rechercher_code", description="Recherche des notions, articles ou termes dans un code francais via Legifrance/PISTE.")
-def rechercher_code(search: str, code_name: str, champ: str | None = None, sort: Literal["PERTINENCE", "DATE_ASC", "DATE_DESC"] | None = None, type_recherche: str | None = None, page_size: int | None = 10, fetch_all: bool | None = False) -> Any:
-    return _post(LEGIFRANCE_CODE_PATH, {"search": search, "code_name": code_name, "champ": champ, "sort": sort, "type_recherche": type_recherche, "page_size": page_size, "fetch_all": fetch_all})
+@app.post("/mcp/messages")
+async def mcp_messages(request: Request):
+    await sse.handle_post_message(request.scope, request.receive, request._send)
 
 
-@mcp.tool(name="rechercher_jurisprudence_judiciaire", description="Recherche la jurisprudence judiciaire francaise dans la base JURI de Legifrance via PISTE.")
-def rechercher_jurisprudence_judiciaire(search: str, publication_bulletin: list[Literal["T", "F"]] | None = None, sort: Literal["PERTINENCE", "DATE_DESC", "DATE_ASC"] | None = "PERTINENCE", champ: str | None = "ALL", type_recherche: str | None = "TOUS_LES_MOTS_DANS_UN_CHAMP", page_size: int | None = 10, fetch_all: bool | None = False, juri_keys: list[str] | None = None, juridiction_judiciaire: list[str] | None = None) -> Any:
-    return _post(LEGIFRANCE_JURI_PATH, {"search": search, "publication_bulletin": publication_bulletin, "sort": sort, "champ": champ, "type_recherche": type_recherche, "page_size": page_size, "fetch_all": fetch_all, "juri_keys": juri_keys, "juridiction_judiciaire": juridiction_judiciaire})
+@app.get("/")
+def health():
+    return {"status": "ok", "transport": "sse", "env_ok": bool(PISTE_CLIENT_ID and PISTE_CLIENT_SECRET and LEGIFRANCE_BASE_URL)}
 
 
-# L'app MCP est exposee a la racine de /api/mcp -> Vercel la sert sur /mcp
-app = mcp.streamable_http_app()
 handler = Mangum(app, lifespan="off", api_gateway_base_path="/")
